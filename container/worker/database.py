@@ -4,6 +4,8 @@
 """
 
 import asyncpg
+import asyncio
+from functools import wraps
 from typing import Optional, Tuple, Dict, Any
 import logging
 
@@ -13,29 +15,116 @@ from .errors import NoTasksAvailableError, NoProxiesAvailableError
 logger = logging.getLogger(__name__)
 
 
+def db_retry(max_attempts: int = 3, initial_delay: float = 2.0):
+    """
+    Декоратор для повторных попыток при ошибках соединения с БД
+
+    Использует exponential backoff: 2s -> 4s -> 8s
+    Обрабатывает временные ошибки соединения с PostgreSQL
+
+    Args:
+        max_attempts: Максимальное количество попыток (по умолчанию 3)
+        initial_delay: Начальная задержка в секундах (по умолчанию 2.0)
+
+    Raises:
+        asyncpg.exceptions.*: После исчерпания попыток пробрасывает исходное исключение
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = initial_delay
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except (
+                    asyncpg.exceptions.PostgresConnectionError,
+                    asyncpg.exceptions.InterfaceError,
+                    asyncpg.exceptions.CannotConnectNowError,
+                    asyncpg.exceptions.ConnectionDoesNotExistError,
+                ) as e:
+                    last_exception = e
+
+                    if attempt == max_attempts:
+                        logger.error(
+                            f"{func.__name__} failed after {max_attempts} attempts: {e}"
+                        )
+                        raise
+
+                    logger.warning(
+                        f"{func.__name__} attempt {attempt}/{max_attempts} failed: {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff: 2s -> 4s -> 8s
+
+            raise last_exception
+
+        return wrapper
+    return decorator
+
+
 async def create_pool() -> asyncpg.Pool:
     """
-    Создает пул соединений к PostgreSQL
+    Создает пул соединений к PostgreSQL с retry механизмом
+
+    Использует 3 попытки с exponential backoff (2s -> 4s -> 8s)
 
     Returns:
         asyncpg.Pool: Пул соединений
+
+    Raises:
+        asyncpg.exceptions.*: После исчерпания попыток пробрасывает исходное исключение
     """
     logger.info(
         f"Создание пула соединений к БД: {config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
     )
 
-    pool = await asyncpg.create_pool(
-        host=config.DB_HOST,
-        port=config.DB_PORT,
-        database=config.DB_NAME,
-        user=config.DB_USER,
-        password=config.DB_PASSWORD,
-        min_size=config.POOL_MIN_SIZE,
-        max_size=config.POOL_MAX_SIZE,
-    )
+    max_attempts = 3
+    delay = 2.0
+    last_exception = None
 
-    logger.info("Пул соединений создан успешно")
-    return pool
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pool = await asyncpg.create_pool(
+                host=config.DB_HOST,
+                port=config.DB_PORT,
+                database=config.DB_NAME,
+                user=config.DB_USER,
+                password=config.DB_PASSWORD,
+                min_size=config.POOL_MIN_SIZE,
+                max_size=config.POOL_MAX_SIZE,
+            )
+
+            logger.info("Пул соединений создан успешно")
+            return pool
+
+        except (
+            asyncpg.exceptions.PostgresConnectionError,
+            asyncpg.exceptions.InterfaceError,
+            asyncpg.exceptions.CannotConnectNowError,
+            asyncpg.exceptions.ConnectionDoesNotExistError,
+            OSError,  # Сетевые ошибки (connection refused, timeout)
+        ) as e:
+            last_exception = e
+
+            if attempt == max_attempts:
+                logger.error(
+                    f"Не удалось создать пул соединений после {max_attempts} попыток: {e}"
+                )
+                raise
+
+            logger.warning(
+                f"create_pool attempt {attempt}/{max_attempts} failed: {e}. "
+                f"Retrying in {delay}s..."
+            )
+
+            await asyncio.sleep(delay)
+            delay *= 2  # Exponential backoff: 2s -> 4s -> 8s
+
+    raise last_exception
 
 
 async def close_pool(pool: asyncpg.Pool) -> None:
@@ -51,41 +140,70 @@ async def close_pool(pool: asyncpg.Pool) -> None:
 
 async def return_stuck_tasks(pool: asyncpg.Pool) -> int:
     """
-    Возвращает зависшие задачи в очередь
+    Возвращает зависшие задачи в очередь или помечает как ошибку
 
     Ищет задачи со статусом 'в работе', у которых last_heartbeat
-    был более STUCK_TASK_TIMEOUT секунд назад, и возвращает их статус в 'новая'
+    был более STUCK_TASK_TIMEOUT секунд назад.
+
+    - Если retry_count < MAX_RETRY_ATTEMPTS: возврат в очередь с increment retry_count
+    - Если retry_count >= MAX_RETRY_ATTEMPTS: пометка как 'ошибка'
 
     Args:
         pool: Пул соединений asyncpg
 
     Returns:
-        int: Количество возвращенных задач
+        int: Количество обработанных задач (возвращено + помечено как ошибка)
     """
-    result = await pool.execute(
+    # Возвращаем задачи с непревышенным лимитом попыток
+    returned = await pool.execute(
         """
         UPDATE tasks
         SET status = 'новая',
             worker_id = NULL,
-            taken_at = NULL
+            taken_at = NULL,
+            retry_count = retry_count + 1
         WHERE status = 'в работе'
           AND last_heartbeat < NOW() - INTERVAL '1 second' * $1
+          AND retry_count < $2
         """,
         config.STUCK_TASK_TIMEOUT,
+        config.MAX_RETRY_ATTEMPTS,
     )
 
-    # Извлекаем количество обновленных строк из результата "UPDATE N"
-    updated_count = int(result.split()[-1]) if result and 'UPDATE' in result else 0
+    # Помечаем как ошибку задачи с превышенным лимитом
+    marked = await pool.execute(
+        """
+        UPDATE tasks
+        SET status = 'ошибка',
+            worker_id = NULL,
+            taken_at = NULL,
+            error_message = 'Превышено максимальное количество попыток (stuck timeout)'
+        WHERE status = 'в работе'
+          AND last_heartbeat < NOW() - INTERVAL '1 second' * $1
+          AND retry_count >= $2
+        """,
+        config.STUCK_TASK_TIMEOUT,
+        config.MAX_RETRY_ATTEMPTS,
+    )
 
-    if updated_count > 0:
+    returned_count = int(returned.split()[-1]) if returned and 'UPDATE' in returned else 0
+    marked_count = int(marked.split()[-1]) if marked and 'UPDATE' in marked else 0
+
+    if returned_count > 0:
         logger.warning(
-            f"Возвращено зависших задач в очередь: {updated_count} "
+            f"Возвращено зависших задач в очередь: {returned_count} "
             f"(timeout: {config.STUCK_TASK_TIMEOUT}s)"
         )
 
-    return updated_count
+    if marked_count > 0:
+        logger.error(
+            f"Помечено зависших задач как ошибка (превышен лимит попыток): {marked_count}"
+        )
+
+    return returned_count + marked_count
 
 
+@db_retry(max_attempts=3, initial_delay=2.0)
 async def take_next_task(pool: asyncpg.Pool, worker_id: str) -> Optional[Tuple[int, str]]:
     """
     Атомарно берет следующую задачу из очереди
@@ -210,24 +328,30 @@ async def release_proxy(pool: asyncpg.Pool, proxy_id: int) -> None:
     )
 
 
+@db_retry(max_attempts=3, initial_delay=2.0)
 async def update_heartbeat(pool: asyncpg.Pool, task_id: int) -> None:
     """
     Обновляет last_heartbeat для задачи
 
     Вызывается фоновой задачей каждые HEARTBEAT_INTERVAL секунд
+    Gracefully обрабатывает PoolClosedError (нормально при shutdown)
 
     Args:
         pool: Пул соединений asyncpg
         task_id: ID задачи
     """
-    await pool.execute(
-        """
-        UPDATE tasks
-        SET last_heartbeat = NOW()
-        WHERE id = $1 AND status = 'в работе'
-        """,
-        task_id,
-    )
+    try:
+        await pool.execute(
+            """
+            UPDATE tasks
+            SET last_heartbeat = NOW()
+            WHERE id = $1 AND status = 'в работе'
+            """,
+            task_id,
+        )
+    except asyncpg.exceptions.PoolClosedError:
+        # Это нормально при graceful shutdown - пул уже закрыт
+        logger.debug(f"Пул соединений закрыт при обновлении heartbeat для задачи #{task_id}")
 
 
 async def complete_task(
@@ -391,3 +515,230 @@ async def get_task_retry_count(pool: asyncpg.Pool, task_id: int) -> int:
     )
 
     return row['retry_count'] if row else 0
+
+
+@db_retry(max_attempts=3, initial_delay=2.0)
+async def save_parsed_card(
+    pool: asyncpg.Pool,
+    avito_item_id: int,
+    article: str,
+    title: str,
+    description: str,
+    price: float,
+    seller_name: str,
+    parsed_data: dict
+) -> None:
+    """
+    Сохраняет спаршенную карточку в БД
+
+    При конфликте по avito_item_id обновляет связь с артикулом
+
+    Args:
+        pool: Пул соединений asyncpg
+        avito_item_id: ID объявления с Авито
+        article: Артикул
+        title: Название объявления
+        description: Описание
+        price: Цена
+        seller_name: Ник продавца
+        parsed_data: Все спаршенные поля в JSON
+    """
+    await pool.execute(
+        """
+        INSERT INTO parsed_cards (
+            avito_item_id, article, title, description, price, seller_name, parsed_data
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (avito_item_id) DO UPDATE SET
+            article = EXCLUDED.article,
+            parsed_at = NOW()
+        """,
+        avito_item_id,
+        article,
+        title,
+        description,
+        price,
+        seller_name,
+        parsed_data,
+    )
+
+
+async def check_existing_cards(pool: asyncpg.Pool, avito_ids: list) -> set:
+    """
+    Проверяет какие карточки уже существуют в БД
+
+    Args:
+        pool: Пул соединений asyncpg
+        avito_ids: Список ID объявлений для проверки
+
+    Returns:
+        set[int]: Множество существующих ID
+    """
+    if not avito_ids:
+        return set()
+
+    rows = await pool.fetch(
+        """
+        SELECT avito_item_id FROM parsed_cards
+        WHERE avito_item_id = ANY($1)
+        """,
+        avito_ids,
+    )
+
+    return {row['avito_item_id'] for row in rows}
+
+
+@db_retry(max_attempts=3, initial_delay=2.0)
+async def save_validation_result(
+    pool: asyncpg.Pool,
+    avito_item_id: int,
+    validation_type: str,
+    passed: bool,
+    rejection_reason: Optional[str],
+    validation_details: Optional[dict]
+) -> None:
+    """
+    Сохраняет результат валидации
+
+    Args:
+        pool: Пул соединений asyncpg
+        avito_item_id: ID объявления
+        validation_type: 'механическая' или 'ИИ'
+        passed: Прошло валидацию или нет
+        rejection_reason: Причина отклонения (текст)
+        validation_details: Детали валидации (JSONB) - может быть None
+    """
+    await pool.execute(
+        """
+        INSERT INTO validation_results (
+            avito_item_id, validation_type, passed, rejection_reason, validation_details
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        avito_item_id,
+        validation_type,
+        passed,
+        rejection_reason,
+        validation_details,
+    )
+
+
+async def get_cards_for_ai_validation(pool: asyncpg.Pool, article: str) -> list:
+    """
+    Получает карточки, прошедшие механическую валидацию
+
+    Выбирает только те карточки по артикулу, где последняя валидация
+    была механической и успешной
+
+    Args:
+        pool: Пул соединений asyncpg
+        article: Артикул
+
+    Returns:
+        list[dict]: Список карточек с полями: avito_item_id, title, description, price
+    """
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT c.avito_item_id, c.title, c.description, c.price
+        FROM parsed_cards c
+        INNER JOIN validation_results v ON c.avito_item_id = v.avito_item_id
+        WHERE c.article = $1
+          AND v.validation_type = 'механическая'
+          AND v.passed = TRUE
+          AND NOT EXISTS (
+              SELECT 1 FROM validation_results v2
+              WHERE v2.avito_item_id = c.avito_item_id
+                AND v2.validation_type = 'ИИ'
+          )
+        """,
+        article,
+    )
+
+    return [dict(row) for row in rows]
+
+
+@db_retry(max_attempts=3, initial_delay=2.0)
+async def get_cards_for_detailed_parsing(pool: asyncpg.Pool, article: str) -> list:
+    """
+    Получает карточки, прошедшие обе валидации и нуждающиеся в детальном парсинге
+
+    Выбирает карточки которые:
+    1. Прошли механическую валидацию
+    2. Прошли ИИ-валидацию
+    3. Не имеют детальных данных (published_at IS NULL)
+
+    Args:
+        pool: Пул соединений asyncpg
+        article: Артикул
+
+    Returns:
+        list[dict]: Список карточек с полями: avito_item_id, title
+    """
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT c.avito_item_id, c.title
+        FROM parsed_cards c
+        WHERE c.article = $1
+          AND c.published_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM validation_results v1
+              WHERE v1.avito_item_id = c.avito_item_id
+                AND v1.validation_type = 'механическая'
+                AND v1.passed = TRUE
+          )
+          AND EXISTS (
+              SELECT 1 FROM validation_results v2
+              WHERE v2.avito_item_id = c.avito_item_id
+                AND v2.validation_type = 'ИИ'
+                AND v2.passed = TRUE
+          )
+        ORDER BY c.avito_item_id
+        """,
+        article,
+    )
+
+    return [dict(row) for row in rows]
+
+
+@db_retry(max_attempts=3, initial_delay=2.0)
+async def update_card_detailed_data(
+    pool: asyncpg.Pool,
+    avito_item_id: int,
+    detailed_data: dict
+) -> None:
+    """
+    Обновляет карточку детальными данными после парсинга страницы объявления
+
+    Args:
+        pool: Пул соединений asyncpg
+        avito_item_id: ID объявления
+        detailed_data: Детальные данные из парсинга (все поля из avito-library)
+
+    Raises:
+        ValueError: Если карточка не найдена в БД
+    """
+    result = await pool.execute(
+        """
+        UPDATE parsed_cards
+        SET
+            published_at = $2,
+            location = $3,
+            views_count = $4,
+            characteristics = $5,
+            parsed_data = parsed_data || $6::jsonb,
+            parsed_at = NOW()
+        WHERE avito_item_id = $1
+        """,
+        avito_item_id,
+        detailed_data.get('published_at'),
+        detailed_data.get('location'),
+        detailed_data.get('views_count'),
+        detailed_data.get('characteristics'),
+        detailed_data,
+    )
+
+    # Проверка что строка была обновлена (критично для отлова ошибок)
+    updated_count = int(result.split()[-1]) if result and 'UPDATE' in result else 0
+    if updated_count == 0:
+        logger.error(f"Карточка {avito_item_id} не найдена в БД при обновлении детальных данных")
+        raise ValueError(f"Card {avito_item_id} not found in database")

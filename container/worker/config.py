@@ -17,16 +17,17 @@ DB_USER = os.getenv('DB_USER', 'admin')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'Password123')
 
 # Настройки пула соединений asyncpg
+# ВАЖНО: 15 воркеров × POOL_MAX_SIZE должно быть < PostgreSQL max_connections (обычно 100)
 POOL_MIN_SIZE = 2
-POOL_MAX_SIZE = 10
+POOL_MAX_SIZE = 5  # 15 воркеров × 5 = 75 подключений (безопасно для стандартного max_connections=100)
 
 # Таймауты и интервалы (в секундах)
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '120'))  # 2 минуты
 STUCK_TASK_TIMEOUT = int(os.getenv('STUCK_TASK_TIMEOUT', '3600'))  # 1 час
 MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', '3'))
 
-# API ключ для ИИ-валидации (OpenAI)
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+# API ключ для ИИ-валидации (Gemini через Google AI Studio)
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAjRQnMmqZjt3eJnSoLlho1gC9fv1IcCo')
 
 # Интервалы ожидания при отсутствии задач/прокси (в секундах)
 NO_TASKS_WAIT = 5

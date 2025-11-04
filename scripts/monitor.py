@@ -12,10 +12,28 @@ import os
 from pathlib import Path
 from typing import Dict, List
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 # Добавляем путь к модулю db_utils
 sys.path.append(str(Path(__file__).parent))
 import db_utils
+
+
+@asynccontextmanager
+async def db_connection():
+    """
+    Async context manager для безопасной работы с БД соединением
+
+    Гарантирует закрытие соединения даже при исключении
+
+    Yields:
+        Connection: Соединение с БД
+    """
+    conn = await db_utils.connect_db()
+    try:
+        yield conn
+    finally:
+        await db_utils.close_connection(conn)
 
 
 async def get_tasks_stats(conn) -> Dict[str, int]:
@@ -295,50 +313,43 @@ async def main():
     if mode == 'watch':
         interval = get_interval()
 
-    conn = None
-
     try:
-        # Подключение к БД
+        # Подключение к БД через context manager (гарантирует закрытие)
         print("\nПодключение к БД...")
-        conn = await db_utils.connect_db()
-        config = db_utils.get_db_config()
-        print(f"✓ Подключено к {config['host']}:{config['port']}/{config['database']}")
+        async with db_connection() as conn:
+            config = db_utils.get_db_config()
+            print(f"✓ Подключено к {config['host']}:{config['port']}/{config['database']}")
 
-        if mode == 'once':
-            # Однократный вывод статистики
-            print("Получение статистики...\n")
-            await asyncio.sleep(1)  # Небольшая пауза для читаемости
+            if mode == 'once':
+                # Однократный вывод статистики
+                print("Получение статистики...\n")
+                await asyncio.sleep(1)  # Небольшая пауза для читаемости
 
-            tasks_stats, proxies_stats, validation_stats, workers = await fetch_all_stats(conn)
-            display_dashboard(tasks_stats, proxies_stats, validation_stats, workers)
+                tasks_stats, proxies_stats, validation_stats, workers = await fetch_all_stats(conn)
+                display_dashboard(tasks_stats, proxies_stats, validation_stats, workers)
 
-        else:
-            # Циклический режим с автообновлением
-            print(f"Запуск мониторинга с интервалом {interval} сек...")
-            print("Нажмите Ctrl+C для выхода\n")
-            await asyncio.sleep(2)
+            else:
+                # Циклический режим с автообновлением
+                print(f"Запуск мониторинга с интервалом {interval} сек...")
+                print("Нажмите Ctrl+C для выхода\n")
+                await asyncio.sleep(2)
 
-            try:
-                while True:
-                    tasks_stats, proxies_stats, validation_stats, workers = await fetch_all_stats(conn)
-                    display_dashboard(tasks_stats, proxies_stats, validation_stats, workers)
+                try:
+                    while True:
+                        tasks_stats, proxies_stats, validation_stats, workers = await fetch_all_stats(conn)
+                        display_dashboard(tasks_stats, proxies_stats, validation_stats, workers)
 
-                    # Ожидаем интервал
-                    await asyncio.sleep(interval)
+                        # Ожидаем интервал
+                        await asyncio.sleep(interval)
 
-            except KeyboardInterrupt:
-                print("\n\n✓ Мониторинг остановлен пользователем")
+                except KeyboardInterrupt:
+                    print("\n\n✓ Мониторинг остановлен пользователем")
 
     except Exception as e:
         print(f"\n❌ Критическая ошибка: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-    finally:
-        # Закрытие соединения
-        if conn:
-            await db_utils.close_connection(conn)
 
 
 if __name__ == '__main__':

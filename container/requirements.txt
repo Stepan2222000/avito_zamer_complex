@@ -1,14 +1,14 @@
-# PostgreSQL асинхронный драйвер
+# PostgreSQL асинхронный драйвер (последняя версия)
 asyncpg
 
 # Avito Library для парсинга (с GitHub)
 git+https://github.com/Stepan2222000/avito-library.git@main#egg=avito-library
 
-# OpenAI API для ИИ-валидации
+# OpenAI API для ИИ-валидации (последняя версия)
 openai
 
-# Переменные окружения
+# Переменные окружения (последняя версия)
 python-dotenv
 
-# Структурированное логирование
+# Структурированное логирование (последняя версия)
 structlog
