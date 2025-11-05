@@ -114,6 +114,8 @@ async def validate_ai(
     # Подготовка промпта
     user_prompt = format_listings_for_prompt(listings, article)
 
+    result_text = ""
+
     try:
         # Вызов Gemini через OpenAI API с timeout 60 секунд
         response = await asyncio.wait_for(
@@ -149,6 +151,7 @@ async def validate_ai(
                 'rejection_reason': None,
                 'validation_details': {
                     'stage': 'ai',
+                    'model': GEMINI_MODEL,
                     'decision': 'passed'
                 }
             }
@@ -164,8 +167,9 @@ async def validate_ai(
                     'rejection_reason': reason,
                     'validation_details': {
                         'stage': 'ai',
+                        'model': GEMINI_MODEL,
                         'decision': 'rejected',
-                        'model_reason': reason
+                        'reason': reason
                     }
                 }
 
@@ -178,15 +182,17 @@ async def validate_ai(
 
     except json.JSONDecodeError as e:
         logger.warning(f"Ошибка парсинга JSON от Gemini: {e}, response: {result_text[:200]}")
-        # Fallback: считаем что все прошли
+        # Fallback: помечаем объявления как требующие ручной проверки
         return {
             item.get('avito_item_id'): {
-                'passed': True,
-                'rejection_reason': None,
+                'passed': False,
+                'rejection_reason': 'ai_json_parse_error',
                 'validation_details': {
                     'stage': 'ai',
-                    'decision': 'passed',
-                    'fallback': 'json_decode_error'
+                    'model': GEMINI_MODEL,
+                    'decision': 'error',
+                    'fallback': 'json_decode_error',
+                    'raw_excerpt': (result_text[:200].strip() if result_text else None)
                 }
             }
             for item in listings if item.get('avito_item_id')

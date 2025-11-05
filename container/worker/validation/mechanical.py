@@ -5,7 +5,7 @@
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 from ..stopwords import STOPWORDS
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def check_stopwords(text: str) -> list:
     return found
 
 
-def calculate_price_threshold(prices: list) -> Optional[float]:
+def calculate_price_threshold(prices: list) -> Tuple[Optional[float], dict[str, float | int]]:
     """
     Вычисляет ценовой порог (50% от средней топ-20%)
 
@@ -58,7 +58,7 @@ def calculate_price_threshold(prices: list) -> Optional[float]:
         Optional[float]: Пороговая цена или None если недостаточно данных
     """
     if not prices:
-        return None
+        return None, {}
 
     # Сортируем по убыванию
     sorted_prices = sorted(prices, reverse=True)
@@ -90,7 +90,13 @@ def calculate_price_threshold(prices: list) -> Optional[float]:
         f"медиана {median:.2f}, порог 50% = {threshold:.2f}"
     )
 
-    return threshold
+    # Возвращаем как сам порог, так и данные расчёта для аудита
+    return threshold, {
+        'top20_count': top20_count,
+        'median_top20': median,
+        'average_top20': avg_top20,
+        'filtered_top20_count': len(filtered_top20)
+    }
 
 
 def validate_mechanical(listings: list) -> dict:
@@ -108,7 +114,7 @@ def validate_mechanical(listings: list) -> dict:
 
     results = {}
     prices = [item.get('price', 0) for item in listings if item.get('price')]
-    price_threshold = calculate_price_threshold(prices)
+    price_threshold, price_stats = calculate_price_threshold(prices)
 
     for item in listings:
         avito_id = item.get('avito_item_id')
@@ -128,21 +134,21 @@ def validate_mechanical(listings: list) -> dict:
         all_stopwords = stopwords_title + stopwords_desc + stopwords_seller
 
         # Проверка цены
-        price_valid = True
+        price_passed = True
         if price_threshold and price > 0:
-            price_valid = price >= price_threshold
+            price_passed = price >= price_threshold
 
         # Определение результата
-        passed = not all_stopwords and price_valid
+        passed = not all_stopwords and price_passed
 
         if all_stopwords:
             rejection_reason = 'stopwords'
-        elif not price_valid:
+        elif not price_passed:
             rejection_reason = 'price'
         else:
             rejection_reason = None
 
-        # Собираем JSON с деталями проверки для аудита
+        # Сохраняем детали проверки для аудита
         validation_details = {
             'stage': 'mechanical',
             'stopwords': {
@@ -150,16 +156,20 @@ def validate_mechanical(listings: list) -> dict:
                 'description': stopwords_desc,
                 'seller': stopwords_seller,
                 'all': all_stopwords,
+                'has_matches': bool(all_stopwords)
             },
             'price': {
                 'value': price,
                 'threshold': price_threshold,
+                'threshold_available': price_threshold is not None,
+                'passed_threshold': price_passed,
+                'calculation': price_stats.copy() if price_stats else None,
                 # True/False/None, чтобы было видно применялся ли порог
                 'below_threshold': (
                     price_threshold is not None
                     and price > 0
                     and price < price_threshold
-                )
+                ),
             }
         }
 
