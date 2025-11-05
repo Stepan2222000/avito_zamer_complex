@@ -147,7 +147,10 @@ async def validate_ai(
             results[avito_id] = {
                 'passed': True,
                 'rejection_reason': None,
-                'validation_details': None
+                'validation_details': {
+                    'stage': 'ai',
+                    'decision': 'passed'
+                }
             }
 
         # Отклоненные
@@ -158,8 +161,12 @@ async def validate_ai(
             if avito_id:
                 results[avito_id] = {
                     'passed': False,
-                    'rejection_reason': 'ai_detected',
-                    'validation_details': None
+                    'rejection_reason': reason,
+                    'validation_details': {
+                        'stage': 'ai',
+                        'decision': 'rejected',
+                        'model_reason': reason
+                    }
                 }
 
         return results
@@ -176,7 +183,11 @@ async def validate_ai(
             item.get('avito_item_id'): {
                 'passed': True,
                 'rejection_reason': None,
-                'validation_details': None
+                'validation_details': {
+                    'stage': 'ai',
+                    'decision': 'passed',
+                    'fallback': 'json_decode_error'
+                }
             }
             for item in listings if item.get('avito_item_id')
         }

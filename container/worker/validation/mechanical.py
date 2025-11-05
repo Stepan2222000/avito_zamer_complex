@@ -142,8 +142,26 @@ def validate_mechanical(listings: list) -> dict:
         else:
             rejection_reason = None
 
-        # Минимальная структура validation_details (согласно ответу 3A)
-        validation_details = None
+        # Собираем JSON с деталями проверки для аудита
+        validation_details = {
+            'stage': 'mechanical',
+            'stopwords': {
+                'title': stopwords_title,
+                'description': stopwords_desc,
+                'seller': stopwords_seller,
+                'all': all_stopwords,
+            },
+            'price': {
+                'value': price,
+                'threshold': price_threshold,
+                # True/False/None, чтобы было видно применялся ли порог
+                'below_threshold': (
+                    price_threshold is not None
+                    and price > 0
+                    and price < price_threshold
+                )
+            }
+        }
 
         results[avito_id] = {
             'passed': passed,

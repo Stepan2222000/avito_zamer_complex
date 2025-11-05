@@ -13,7 +13,8 @@
 import asyncio
 import signal
 import logging
-from typing import Optional, Tuple
+from dataclasses import asdict
+from typing import Optional
 from playwright.async_api import Page, Error as PlaywrightError
 
 # Импорты из avito-library (обязательная зависимость)
@@ -23,6 +24,8 @@ from avito_library.parsers.catalog_parser import (
     parse_catalog_until_complete,
     wait_for_page_request,
     supply_page,
+    CatalogListing,
+    CatalogParseStatus,
 )
 from avito_library.parsers.catalog_parser.steam import PageRequest
 # Детекторы состояний страницы
@@ -270,6 +273,70 @@ async def release_and_cleanup_current_proxy(log_prefix: str = "release") -> None
 
     if proxy_to_release:
         await database.release_proxy(pool, proxy_to_release)
+
+
+def _extract_numeric_id(raw_id: Optional[str]) -> Optional[int]:
+    """
+    Преобразует строковый идентификатор объявления в числовой avito_item_id.
+    """
+    if not raw_id:
+        return None
+
+    digits_only = "".join(ch for ch in str(raw_id) if ch.isdigit())
+    if not digits_only:
+        return None
+
+    try:
+        return int(digits_only)
+    except ValueError:
+        logger.debug(f"Не удалось преобразовать item_id '{raw_id}' в число")
+        return None
+
+
+def _normalize_catalog_listing(listing: CatalogListing) -> dict:
+    """
+    Приводит CatalogListing из avito-library к словарю, который ожидает пайплайн.
+    """
+    listing_dict = asdict(listing)
+
+    raw_item_id = listing_dict.get("item_id") or None
+    avito_item_id = _extract_numeric_id(raw_item_id)
+    price_value = listing_dict.get("price")
+
+    normalized = {
+        "avito_item_id": avito_item_id,
+        "item_id": raw_item_id,
+        "title": listing_dict.get("title") or "",
+        "description": listing_dict.get("snippet_text") or "",
+        "snippet_text": listing_dict.get("snippet_text"),
+        "price": price_value if price_value is not None else 0,
+        "seller": listing_dict.get("seller_name") or "",
+        "seller_name": listing_dict.get("seller_name"),
+        "seller_id": listing_dict.get("seller_id"),
+        "seller_rating": listing_dict.get("seller_rating"),
+        "seller_reviews": listing_dict.get("seller_reviews"),
+        "location_city": listing_dict.get("location_city"),
+        "location_area": listing_dict.get("location_area"),
+        "location_extra": listing_dict.get("location_extra"),
+        "promoted": listing_dict.get("promoted"),
+        "published_ago": listing_dict.get("published_ago"),
+    }
+
+    if listing_dict.get("raw_html"):
+        normalized["raw_html"] = listing_dict["raw_html"]
+
+    return normalized
+
+
+def _is_attempts_exhausted(details: Optional[str]) -> bool:
+    """
+    Определяет, сигнализирует ли текст details о достижении лимита попыток.
+    """
+    if not details:
+        return False
+
+    marker = "лимит запросов дополнительной страницы"
+    return marker in details.lower()
 
 
 async def process_validation_and_save(
@@ -582,22 +649,55 @@ async def parse_detailed_cards(
 
 async def orchestrator_task(page: Page, catalog_url: str) -> dict:
     """
-    Задача оркестратора - вызывает parse_catalog_until_complete
+    Задача оркестратора - вызывает parse_catalog_until_complete и
+    приводит результат к ожидаемому формату пайплайна.
 
     Args:
         page: Страница Playwright
         catalog_url: URL каталога
 
     Returns:
-        dict: Результаты парсинга
+        dict: нормализованный результат парсинга
     """
-    result = await parse_catalog_until_complete(
+    listings, meta = await parse_catalog_until_complete(
         page=page,
         catalog_url=catalog_url,
-        fields=['avito_id', 'title', 'description', 'price', 'seller'],
+        fields=[
+            'title',
+            'price',
+            'seller_name',
+            'snippet',
+            'published',
+        ],
         max_pages=None,  # БЕЗ ОГРАНИЧЕНИЙ - парсим все страницы
         sort_by_date=True,
         start_page=1
+    )
+
+    normalized_listings = [_normalize_catalog_listing(item) for item in listings]
+
+    attempts_exhausted = _is_attempts_exhausted(meta.details)
+    status_name = meta.status.name if isinstance(meta.status, CatalogParseStatus) else str(meta.status)
+
+    meta_dict = asdict(meta)
+    meta_dict['status'] = status_name
+
+    result = {
+        'status': status_name,
+        'details': meta.details,
+        'attempts_exhausted': attempts_exhausted,
+        'listings': normalized_listings,
+        'processed_pages': meta.processed_pages,
+        'processed_cards': meta.processed_cards,
+        'last_state': meta.last_state,
+        'last_url': meta.last_url,
+        'completed': meta.status is CatalogParseStatus.SUCCESS,
+        'meta': meta_dict,
+    }
+
+    logger.info(
+        f"Оркестратор завершил парсинг каталога: status={result['status']}, "
+        f"listings={len(normalized_listings)}, attempts_exhausted={attempts_exhausted}"
     )
 
     return result
