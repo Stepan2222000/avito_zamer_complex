@@ -1,13 +1,9 @@
-version: '3.8'
 
 services:
   worker:
     build:
       context: ./container
       dockerfile: Dockerfile
-    deploy:
-      replicas: 15
-    restart: always
     environment:
       # Database
       - DB_HOST=${DB_HOST}
@@ -16,8 +12,8 @@ services:
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
 
-      # Worker settings
-      - WORKER_ID=${HOSTNAME}
+      # Worker settings (multiprocessing)
+      - NUM_WORKERS=${NUM_WORKERS:-15}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-120}
       - STUCK_TASK_TIMEOUT=${STUCK_TASK_TIMEOUT:-3600}
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
@@ -31,29 +27,16 @@ services:
       # API keys
       - GEMINI_API_KEY=${GEMINI_API_KEY}
 
-      # Display for Playwright (headless=false)
-      - DISPLAY=:99
-
     volumes:
       # X11 для виртуального дисплея
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-
-    # Увеличенная shared memory для Chromium
-    shm_size: 2gb
-
-    # Лимиты ресурсов (опционально)
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '1.0'
-          memory: 2G
-
-    # Healthcheck (опционально)
+    # Увеличенная shared memory для Chromium (NUM_WORKERS браузеров в одном контейнере)
+    # 6GB для безопасности (15 воркеров × ~300-400MB на пиках)
+    shm_size: 6gb
+    restart: always
+    # Healthcheck - использует отдельный скрипт для безопасности
     healthcheck:
-      test: ["CMD", "python", "-c", "import asyncio; import asyncpg; asyncio.run(asyncpg.connect(host='${DB_HOST}', port=${DB_PORT}, database='${DB_NAME}', user='${DB_USER}', password='${DB_PASSWORD}', timeout=5))"]
+      test: ["CMD", "/app/healthcheck.sh"]
       interval: 60s
       timeout: 10s
       retries: 3

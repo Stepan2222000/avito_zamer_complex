@@ -16,10 +16,13 @@ DB_NAME = os.getenv('DB_NAME', 'system_avito_zamer')
 DB_USER = os.getenv('DB_USER', 'admin')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'Password123')
 
+# Количество воркеров (multiprocessing)
+NUM_WORKERS = int(os.getenv('NUM_WORKERS', '15'))
+
 # Настройки пула соединений asyncpg
-# ВАЖНО: 15 воркеров × POOL_MAX_SIZE должно быть < PostgreSQL max_connections (обычно 100)
-POOL_MIN_SIZE = 2
-POOL_MAX_SIZE = 5  # 15 воркеров × 5 = 75 подключений (безопасно для стандартного max_connections=100)
+# ВАЖНО: NUM_WORKERS × POOL_MAX_SIZE должно быть < PostgreSQL max_connections (обычно 100)
+POOL_MIN_SIZE = int(os.getenv('POOL_MIN_SIZE', '2'))
+POOL_MAX_SIZE = int(os.getenv('POOL_MAX_SIZE', '5'))  # NUM_WORKERS × 5 подключений
 
 # Таймауты и интервалы (в секундах)
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '120'))  # 2 минуты
@@ -31,11 +34,12 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAjRQnMmqZjt3eJnSoLlho1gC9fv1
 
 # Интервалы ожидания при отсутствии задач/прокси (в секундах)
 NO_TASKS_WAIT = 5
-NO_PROXIES_WAIT = 60
+NO_PROXIES_WAIT = 20
 
 # Уникальный идентификатор воркера
-# Формируется из hostname контейнера + UUID для уникальности
-WORKER_ID = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+# Устанавливается supervisor'ом (например: worker_1, worker_2, ...)
+# Если переменная не установлена (старый режим), используем hostname + UUID
+WORKER_ID = os.getenv('WORKER_ID', f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}")
 
 
 def get_db_dsn() -> str:

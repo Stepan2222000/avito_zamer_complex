@@ -1,5 +1,5 @@
 # PostgreSQL асинхронный драйвер (последняя версия)
-asyncpg
+asyncpg>=0.29.0
 
 # Avito Library для парсинга (с GitHub)
 git+https://github.com/Stepan2222000/avito-library.git@main#egg=avito-library

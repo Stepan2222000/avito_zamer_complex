@@ -16,35 +16,26 @@ import logging
 from typing import Optional, Tuple
 from playwright.async_api import Page, Error as PlaywrightError
 
-# Импорты из avito-library (будут доступны после установки)
-try:
-    from avito_library import (
-        parse_catalog_until_complete,
-        parse_card,
-        wait_for_page_request,
-        supply_page,
-        resolve_captcha_flow,
-        detect_page_state,
-        PageRequest
-    )
-    # Детекторы состояний страницы
-    from avito_library.detector_ids import (
-        CAPTCHA_DETECTOR_ID,
-        CONTINUE_BUTTON_DETECTOR_ID,
-        PROXY_BLOCK_429_DETECTOR_ID,
-        PROXY_BLOCK_403_DETECTOR_ID,
-        PROXY_AUTH_DETECTOR_ID,
-        NOT_DETECTED_STATE_ID,
-        SUCCESS_DETECTOR_ID,
-        CARD_FOUND_DETECTOR_ID
-    )
-    # Исключения
-    from avito_library.exceptions import CardParsingError
-    AVITO_LIBRARY_AVAILABLE = True
-except ImportError:
-    AVITO_LIBRARY_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.warning("avito-library не установлена - работа в режиме заглушки")
+# Импорты из avito-library (обязательная зависимость)
+from avito_library import resolve_captcha_flow, detect_page_state, CardParsingError
+from avito_library.parsers.card_parser import parse_card
+from avito_library.parsers.catalog_parser import (
+    parse_catalog_until_complete,
+    wait_for_page_request,
+    supply_page,
+)
+from avito_library.parsers.catalog_parser.steam import PageRequest
+# Детекторы состояний страницы
+from avito_library import (
+    CAPTCHA_DETECTOR_ID,
+    CONTINUE_BUTTON_DETECTOR_ID,
+    PROXY_BLOCK_429_DETECTOR_ID,
+    PROXY_BLOCK_403_DETECTOR_ID,
+    PROXY_AUTH_DETECTOR_ID,
+    NOT_DETECTED_STATE_ID,
+    CARD_FOUND_DETECTOR_ID,
+)
+# Исключения
 
 from . import config
 from . import database
@@ -73,6 +64,9 @@ page_instance = None
 # Lock для защиты от race conditions при доступе к прокси и браузеру
 # Используется когда coordinator и main_loop одновременно могут менять состояние
 state_lock = None  # Будет инициализирован как asyncio.Lock() в main()
+
+# Максимум попыток смены прокси при входе в каталог прежде чем вернуть задачу
+CATALOG_PROXY_ROTATION_LIMIT = 5
 
 
 async def graceful_shutdown():
@@ -161,9 +155,6 @@ async def check_and_solve_captcha(page: Page, state: str, context: str = "") -> 
     Returns:
         bool: True если капчи нет или успешно решена, False если не решена
     """
-    if not AVITO_LIBRARY_AVAILABLE:
-        return True
-
     # Проверяем наличие капчи
     if state not in [CAPTCHA_DETECTOR_ID, CONTINUE_BUTTON_DETECTOR_ID, PROXY_BLOCK_429_DETECTOR_ID]:
         return True  # Капчи нет
@@ -178,6 +169,71 @@ async def check_and_solve_captcha(page: Page, state: str, context: str = "") -> 
     else:
         logger.warning(f"Капча {context} не решена")
         return False
+
+
+async def block_and_cleanup_current_proxy(reason: str) -> None:
+    """
+    Блокирует текущий прокси (если есть) и закрывает связанные браузерные ресурсы.
+    """
+    global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance
+
+    old_playwright = playwright_instance
+    old_browser = browser_instance
+    old_context = context_instance
+    old_page = page_instance
+
+    async with state_lock:
+        if current_proxy_id:
+            await database.block_proxy(pool, current_proxy_id, reason)
+        current_proxy_id = None
+        playwright_instance = browser_instance = context_instance = page_instance = None
+
+    try:
+        await browser.cleanup_browser(old_playwright, old_browser, old_context, old_page)
+    except Exception as cleanup_error:
+        logger.error(f"Ошибка cleanup браузера при блокировке прокси: {cleanup_error}", exc_info=True)
+
+
+async def rotate_blocked_proxy(reason: str) -> bool:
+    """
+    Блокирует текущий прокси, берет новый и перезапускает браузер.
+
+    Args:
+        reason: Причина блокировки (логирование в БД)
+
+    Returns:
+        bool: True если удалось взять новый прокси и запустить браузер, иначе False
+    """
+    global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance
+
+    await block_and_cleanup_current_proxy(reason)
+
+    # Берем новый прокси
+    proxy_result = await database.take_free_proxy(pool, config.WORKER_ID)
+    if not proxy_result:
+        logger.error("Нет свободных прокси после блокировки текущего")
+        return False
+
+    new_proxy_id, proxy_address = proxy_result
+    logger.info(f"Пробуем новый прокси после блокировки: {proxy_address.split(':')[0]}:****")
+
+    # Запускаем новый браузер
+    try:
+        new_playwright, new_browser, new_context, new_page = await browser.launch_browser(proxy_address)
+    except Exception as e:
+        logger.error(f"Ошибка запуска браузера при смене прокси: {e}")
+        await database.block_proxy(pool, new_proxy_id, f"Browser launch error after rotate: {e}")
+        return False
+
+    # Фиксируем новые объекты
+    async with state_lock:
+        current_proxy_id = new_proxy_id
+        playwright_instance = new_playwright
+        browser_instance = new_browser
+        context_instance = new_context
+        page_instance = new_page
+
+    return True
 
 
 async def process_validation_and_save(
@@ -335,10 +391,6 @@ async def parse_detailed_cards(
         CaptchaNotSolvedError: Если капча не решена (возврат задачи в очередь)
         ProxyBlockedError: Если прокси заблокирован (возврат задачи в очередь)
     """
-    if not AVITO_LIBRARY_AVAILABLE:
-        logger.warning("[ЗАГЛУШКА] avito-library недоступна, пропуск детального парсинга")
-        return 0
-
     # Получение списка карточек для парсинга
     cards = await database.get_cards_for_detailed_parsing(pool, article)
 
@@ -503,11 +555,6 @@ async def orchestrator_task(page: Page, catalog_url: str) -> dict:
     Returns:
         dict: Результаты парсинга
     """
-    if not AVITO_LIBRARY_AVAILABLE:
-        logger.warning("[ЗАГЛУШКА] avito-library недоступна, имитация парсинга")
-        await asyncio.sleep(5)
-        return {'status': 'SUCCESS', 'listings': [], 'completed': True}
-
     result = await parse_catalog_until_complete(
         page=page,
         catalog_url=catalog_url,
@@ -532,12 +579,6 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
     global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance, state_lock
 
     current_page = initial_page
-
-    if not AVITO_LIBRARY_AVAILABLE:
-        logger.warning("[ЗАГЛУШКА] avito-library недоступна, координатор не активен")
-        # В режиме заглушки координатор просто ждет
-        await asyncio.sleep(10)
-        return
 
     while running:
         try:
@@ -569,6 +610,12 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
 
                 try:
                     # Критическая секция: смена прокси (защита от race condition)
+                    # Сохраняем старые переменные для cleanup вне lock
+                    old_playwright = playwright_instance
+                    old_browser = browser_instance
+                    old_context = context_instance
+                    old_page = current_page
+
                     async with state_lock:
                         # Блокируем текущий прокси
                         await database.block_proxy(pool, current_proxy_id, "Blocked by Avito")
@@ -582,14 +629,15 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
                         current_proxy_id, proxy_address = proxy_result
                         logger.info(f"Взят новый прокси: {proxy_address.split(':')[0]}:****")
 
-                        # Закрываем старый браузер
-                        await browser.cleanup_browser(
-                            playwright_instance, browser_instance, context_instance, current_page
-                        )
+                    # Cleanup и launch ВЫНЕСЕНЫ из lock для предотвращения deadlock
+                    # Закрываем старый браузер
+                    await browser.cleanup_browser(
+                        old_playwright, old_browser, old_context, old_page
+                    )
 
-                        # Запускаем новый браузер с новым прокси
-                        playwright_instance, browser_instance, context_instance, current_page = \
-                            await browser.launch_browser(proxy_address)
+                    # Запускаем новый браузер с новым прокси
+                    playwright_instance, browser_instance, context_instance, current_page = \
+                        await browser.launch_browser(proxy_address)
 
                     # Переходим на нужную страницу каталога (вне lock)
                     url = f"{catalog_url}&p={page_req.next_start_page}"
@@ -609,16 +657,25 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
                     # Проверяем состояние страницы и решаем капчу если есть
                     state = await detect_page_state(current_page)
                     if not await check_and_solve_captcha(current_page, state, "в координаторе"):
-                        # Капча не решена - блокируем прокси, закрываем браузер и делаем continue
-                        logger.warning("Капча не решена после смены прокси, блокируем текущий прокси")
+                        # Капча не решена - освобождаем прокси, закрываем браузер и пробуем другой
+                        logger.warning("Капча не решена после смены прокси, освобождаем текущий прокси")
+
+                        # Сохраняем переменные для cleanup вне lock
+                        cleanup_playwright = playwright_instance
+                        cleanup_browser = browser_instance
+                        cleanup_context = context_instance
+                        cleanup_page = current_page
+
                         async with state_lock:
-                            await database.block_proxy(pool, current_proxy_id, "Captcha failed after proxy change")
-                            # Закрываем браузер перед обнулением переменных (избегаем утечку ресурсов)
-                            await browser.cleanup_browser(
-                                playwright_instance, browser_instance, context_instance, current_page
-                            )
+                            if current_proxy_id:
+                                await database.release_proxy(pool, current_proxy_id)
                             current_proxy_id = None
                             playwright_instance = browser_instance = context_instance = None
+
+                        # Cleanup ВЫНЕСЕН из lock для предотвращения deadlock
+                        await browser.cleanup_browser(
+                            cleanup_playwright, cleanup_browser, cleanup_context, cleanup_page
+                        )
                         continue
 
                 except Exception as e:
@@ -630,15 +687,24 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
                 # Капча или rate limit - пытаемся решить через общую функцию
                 # Передаем любой из капча-детекторов, т.к. resolve_captcha_flow все равно сам определит тип
                 if not await check_and_solve_captcha(current_page, CAPTCHA_DETECTOR_ID, f"от оркестратора ({page_req.status})"):
-                    # Не решилась - блокируем прокси и закрываем браузер
+                    # Не решилась - освобождаем прокси и закрываем браузер
+                    # Сохраняем переменные для cleanup вне lock
+                    cleanup_playwright = playwright_instance
+                    cleanup_browser = browser_instance
+                    cleanup_context = context_instance
+                    cleanup_page = current_page
+
                     async with state_lock:
-                        await database.block_proxy(pool, current_proxy_id, "Captcha failed")
-                        await browser.cleanup_browser(
-                            playwright_instance, browser_instance, context_instance, current_page
-                        )
+                        if current_proxy_id:
+                            await database.release_proxy(pool, current_proxy_id)
                         # Обнуляем все переменные браузера для повторного запуска
                         current_proxy_id = None
                         playwright_instance = browser_instance = context_instance = page_instance = None
+
+                    # Cleanup ВЫНЕСЕН из lock для предотвращения deadlock
+                    await browser.cleanup_browser(
+                        cleanup_playwright, cleanup_browser, cleanup_context, cleanup_page
+                    )
                     # Продолжаем цикл - будет новый запрос (берем новый прокси)
                     continue
 
@@ -647,7 +713,7 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
                 logger.info("NOT_DETECTED - считаем успехом, продолжаем")
 
             # Возвращаем страницу оркестратору
-            await supply_page(current_page)
+            supply_page(current_page)
 
         except asyncio.CancelledError:
             logger.info("Координатор отменен")
@@ -684,19 +750,10 @@ async def worker_main_loop():
                 proxy_result = await database.take_free_proxy(pool, config.WORKER_ID)
 
                 if not proxy_result:
-                    # Проверяем счетчик попыток - если исчерпан, помечаем как ошибку
-                    retry_count = await database.get_task_retry_count(pool, current_task_id)
-                    if retry_count >= config.MAX_RETRY_ATTEMPTS:
-                        logger.error(f"Задача #{current_task_id} исчерпала попытки без прокси")
-                        await database.mark_task_as_error(
-                            pool, current_task_id, "No proxies available after max retries"
-                        )
-                    else:
-                        # Возвращаем в очередь с увеличением счетчика
-                        logger.warning(f"Нет свободных прокси, возврат задачи #{current_task_id} в очередь (попытка {retry_count + 1}/{config.MAX_RETRY_ATTEMPTS})")
-                        await database.return_task_to_queue(
-                            pool, current_task_id, "No proxies available", increment_retry=True
-                        )
+                    logger.warning(f"Нет свободных прокси, возвращаем задачу #{current_task_id} и ждем {config.NO_PROXIES_WAIT} сек")
+                    await database.return_task_to_queue(
+                        pool, current_task_id, "No proxies available", increment_retry=False
+                    )
                     current_task_id = None
                     await asyncio.sleep(config.NO_PROXIES_WAIT)
                     continue
@@ -738,7 +795,9 @@ async def worker_main_loop():
             # ШАГ 4: Переход на каталог и проверка состояния
             catalog_url = f"https://www.avito.ru/rossiya?q={article}&s=104"
 
-            if AVITO_LIBRARY_AVAILABLE:
+            rotation_attempts = 0
+
+            while True:
                 # Проверка что браузер еще подключен и переход
                 try:
                     if browser_instance and not browser_instance.is_connected():
@@ -763,17 +822,18 @@ async def worker_main_loop():
                         pool, current_task_id, f"Catalog goto error: {e}", increment_retry=True
                     )
                     current_task_id = None
-                    continue
+                    break
 
                 state = await detect_page_state(page_instance)
 
                 # Проверка и решение капчи
                 if not await check_and_solve_captcha(page_instance, state, "при переходе на каталог"):
-                    # Капча не решена - блокируем прокси и берем новый
-                    logger.warning("Капча не решена, блокируем прокси")
-                    # Атомарная блокировка прокси, cleanup и обнуление (защита от race condition)
+                    # Капча не решена - освобождаем прокси и берем новый
+                    logger.warning("Капча не решена, освобождаем прокси")
+                    # Атомарное освобождение прокси, cleanup и обнуление (защита от race condition)
                     async with state_lock:
-                        await database.block_proxy(pool, current_proxy_id, "Captcha failed")
+                        if current_proxy_id:
+                            await database.release_proxy(pool, current_proxy_id)
                         await browser.cleanup_browser(
                             playwright_instance, browser_instance, context_instance, page_instance
                         )
@@ -783,24 +843,38 @@ async def worker_main_loop():
                         pool, current_task_id, "Captcha not solved", increment_retry=True
                     )
                     current_task_id = None
-                    continue
+                    break
 
                 # Проверка блокировки прокси
                 if state in [PROXY_BLOCK_403_DETECTOR_ID, PROXY_AUTH_DETECTOR_ID]:
-                    logger.warning("Прокси заблокирован при переходе")
-                    # Атомарная блокировка прокси, cleanup и обнуление (защита от race condition)
-                    async with state_lock:
-                        await database.block_proxy(pool, current_proxy_id, "403/407")
-                        await browser.cleanup_browser(
-                            playwright_instance, browser_instance, context_instance, page_instance
+                    logger.warning("Прокси заблокирован при переходе, пробуем сменить без возврата задачи")
+                    rotation_attempts += 1
+
+                    if rotation_attempts > CATALOG_PROXY_ROTATION_LIMIT:
+                        logger.error("Превышен лимит смены прокси при переходе на каталог")
+                        await block_and_cleanup_current_proxy("Proxy blocked during catalog goto (rotation limit reached)")
+                        await database.return_task_to_queue(
+                            pool, current_task_id, "Proxy blocked (rotation limit)", increment_retry=False
                         )
-                        current_proxy_id = None
-                        playwright_instance = browser_instance = context_instance = page_instance = None
+                        current_task_id = None
+                        break
+
+                    if await rotate_blocked_proxy("Proxy blocked during catalog goto (403/407)"):
+                        logger.info("Прокси сменен, повторяем переход на каталог")
+                        continue
+
+                    logger.error("Не удалось сменить прокси после блокировки")
                     await database.return_task_to_queue(
-                        pool, current_task_id, "Proxy blocked", increment_retry=False
+                        pool, current_task_id, "Proxy blocked (rotation failed)", increment_retry=False
                     )
                     current_task_id = None
-                    continue
+                    break
+
+                # Если дошли сюда - переход успешен
+                break
+
+            if current_task_id is None:
+                continue
 
             # ШАГ 5: Запустить heartbeat
             heartbeat_task = asyncio.create_task(heartbeat_loop(current_task_id))
@@ -821,9 +895,18 @@ async def worker_main_loop():
                     # Cleanup браузера и прокси при ошибке парсинга (избегаем утечку ресурсов)
                     async with state_lock:
                         if playwright_instance and browser_instance:
-                            await browser.cleanup_browser(
-                                playwright_instance, browser_instance, context_instance, page_instance
-                            )
+                            try:
+                                # Добавляем timeout для cleanup чтобы он не зависал
+                                await asyncio.wait_for(
+                                    browser.cleanup_browser(
+                                        playwright_instance, browser_instance, context_instance, page_instance
+                                    ),
+                                    timeout=10
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error("Timeout при cleanup браузера после ошибки парсинга")
+                            except Exception as cleanup_error:
+                                logger.error(f"Ошибка при cleanup браузера: {cleanup_error}", exc_info=True)
                         # Обнуляем переменные браузера и прокси
                         current_proxy_id = None
                         playwright_instance = browser_instance = context_instance = page_instance = None
@@ -929,12 +1012,42 @@ async def worker_main_loop():
             break
         except Exception as e:
             logger.error(f"Ошибка в главном цикле: {e}", exc_info=True)
+
+            # Cleanup ресурсов при критической ошибке
+            async with state_lock:
+                # Cleanup браузера
+                if playwright_instance and browser_instance:
+                    try:
+                        await asyncio.wait_for(
+                            browser.cleanup_browser(
+                                playwright_instance, browser_instance, context_instance, page_instance
+                            ),
+                            timeout=10
+                        )
+                    except Exception as cleanup_error:
+                        logger.error(f"Ошибка при cleanup браузера в главном цикле: {cleanup_error}")
+
+                # Освобождение прокси
+                if current_proxy_id:
+                    try:
+                        await database.release_proxy(pool, current_proxy_id)
+                    except Exception as proxy_error:
+                        logger.error(f"Ошибка при освобождении прокси: {proxy_error}")
+
+                # Обнуляем все переменные
+                current_proxy_id = None
+                playwright_instance = browser_instance = context_instance = page_instance = None
+
             # Возвращаем задачу в очередь если она есть
             if current_task_id:
-                await database.return_task_to_queue(
-                    pool, current_task_id, f"Worker error: {e}", increment_retry=True
-                )
+                try:
+                    await database.return_task_to_queue(
+                        pool, current_task_id, f"Worker error: {e}", increment_retry=True
+                    )
+                except Exception as db_error:
+                    logger.error(f"Ошибка при возврате задачи в очередь: {db_error}")
                 current_task_id = None
+
             await asyncio.sleep(5)
 
 
@@ -954,6 +1067,9 @@ async def main():
     signal.signal(signal.SIGTERM, sigterm_handler)
 
     try:
+        # Логирование успешной инициализации avito-library
+        logger.info("✓ avito-library успешно инициализирована")
+
         # Создание пула соединений
         pool = await database.create_pool()
 

@@ -1,10 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code или CODEX when working with code in this repository.
-
-## ВАЖНО: Обновление документации
-
-**ОБЯЗАТЕЛЬНО НАДО ПЕРИОДИЧЕСКИ ОБНОВЛЯТЬ И ДОБАВЛЯТЬ ИНФОРМАЦИЮ В ЭТОТ ФАЙЛ И СЛЕДИТЬ ЗА ТЕМ, ЧТОБЫ ИНФОРМАЦИЯ НЕ ПРОТИВОРЕЧИЛА РЕАЛЬНОСТИ И ПРОЧИМ ДОКУМЕНТАЦИЯМ**
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Обзор проекта
 
