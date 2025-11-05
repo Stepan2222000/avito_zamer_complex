@@ -65,8 +65,7 @@ page_instance = None
 # Используется когда coordinator и main_loop одновременно могут менять состояние
 state_lock = None  # Будет инициализирован как asyncio.Lock() в main()
 
-# Максимум попыток смены прокси при входе в каталог прежде чем вернуть задачу
-CATALOG_PROXY_ROTATION_LIMIT = 5
+GOTO_FAILURE_LIMIT = 5
 
 
 async def graceful_shutdown():
@@ -222,7 +221,7 @@ async def rotate_blocked_proxy(reason: str) -> bool:
         new_playwright, new_browser, new_context, new_page = await browser.launch_browser(proxy_address)
     except Exception as e:
         logger.error(f"Ошибка запуска браузера при смене прокси: {e}")
-        await database.block_proxy(pool, new_proxy_id, f"Browser launch error after rotate: {e}")
+        await database.release_proxy(pool, new_proxy_id)
         return False
 
     # Фиксируем новые объекты
@@ -234,6 +233,43 @@ async def rotate_blocked_proxy(reason: str) -> bool:
         page_instance = new_page
 
     return True
+
+
+async def release_and_cleanup_current_proxy(log_prefix: str = "release") -> None:
+    """
+    Освобождает текущий прокси (если есть) и закрывает связанные браузерные ресурсы.
+    """
+    global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance
+
+    proxy_to_release = None
+    old_playwright = None
+    old_browser = None
+    old_context = None
+    old_page = None
+
+    async with state_lock:
+        proxy_to_release = current_proxy_id
+        old_playwright = playwright_instance
+        old_browser = browser_instance
+        old_context = context_instance
+        old_page = page_instance
+
+        current_proxy_id = None
+        playwright_instance = browser_instance = context_instance = page_instance = None
+
+    if old_playwright or old_browser or old_context or old_page:
+        try:
+            await asyncio.wait_for(
+                browser.cleanup_browser(old_playwright, old_browser, old_context, old_page),
+                timeout=10
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout при cleanup браузера ({log_prefix})")
+        except Exception as cleanup_error:
+            logger.error(f"Ошибка при cleanup браузера ({log_prefix}): {cleanup_error}", exc_info=True)
+
+    if proxy_to_release:
+        await database.release_proxy(pool, proxy_to_release)
 
 
 async def process_validation_and_save(
@@ -779,9 +815,9 @@ async def worker_main_loop():
                         await browser.launch_browser(proxy_address)
                 except Exception as e:
                     logger.error(f"Ошибка запуска браузера: {e}")
-                    # Атомарная блокировка прокси и обнуление переменных (защита от race condition)
+                    # Атомарное освобождение прокси и обнуление переменных (защита от race condition)
                     async with state_lock:
-                        await database.block_proxy(pool, current_proxy_id, f"Browser launch error: {e}")
+                        await database.release_proxy(pool, current_proxy_id)
                         # Обнуляем все переменные браузера
                         current_proxy_id = None
                         playwright_instance = browser_instance = context_instance = page_instance = None
@@ -807,20 +843,22 @@ async def worker_main_loop():
                     await page_instance.goto(catalog_url, timeout=30000)  # Таймаут 30 секунд
                 except (asyncio.TimeoutError, PlaywrightError) as e:
                     logger.error(f"Ошибка перехода на каталог: {e}")
-                    # Атомарная блокировка прокси, cleanup и обнуление
-                    async with state_lock:
-                        if current_proxy_id:
-                            await database.block_proxy(pool, current_proxy_id, f"Catalog goto error: {e}")
-                        if playwright_instance and browser_instance:
-                            await browser.cleanup_browser(
-                                playwright_instance, browser_instance, context_instance, page_instance
-                            )
-                        current_proxy_id = None
-                        playwright_instance = browser_instance = context_instance = page_instance = None
-                    # Возврат задачи в очередь
-                    await database.return_task_to_queue(
-                        pool, current_task_id, f"Catalog goto error: {e}", increment_retry=True
-                    )
+                    await release_and_cleanup_current_proxy("catalog_goto_error")
+
+                    retry_count = await database.get_task_retry_count(pool, current_task_id)
+                    if retry_count + 1 >= GOTO_FAILURE_LIMIT:
+                        await database.mark_task_as_error(
+                            pool,
+                            current_task_id,
+                            f"Catalog goto failed {retry_count + 1} times: {e}"
+                        )
+                    else:
+                        await database.return_task_to_queue(
+                            pool,
+                            current_task_id,
+                            f"Catalog goto error: {e}",
+                            increment_retry=True
+                        )
                     current_task_id = None
                     break
 
@@ -840,7 +878,7 @@ async def worker_main_loop():
                         current_proxy_id = None
                         playwright_instance = browser_instance = context_instance = page_instance = None
                     await database.return_task_to_queue(
-                        pool, current_task_id, "Captcha not solved", increment_retry=True
+                        pool, current_task_id, "Captcha not solved", increment_retry=False
                     )
                     current_task_id = None
                     break
@@ -850,11 +888,13 @@ async def worker_main_loop():
                     logger.warning("Прокси заблокирован при переходе, пробуем сменить без возврата задачи")
                     rotation_attempts += 1
 
-                    if rotation_attempts > CATALOG_PROXY_ROTATION_LIMIT:
+                    if rotation_attempts >= GOTO_FAILURE_LIMIT:
                         logger.error("Превышен лимит смены прокси при переходе на каталог")
                         await block_and_cleanup_current_proxy("Proxy blocked during catalog goto (rotation limit reached)")
-                        await database.return_task_to_queue(
-                            pool, current_task_id, "Proxy blocked (rotation limit)", increment_retry=False
+                        await database.mark_task_as_error(
+                            pool,
+                            current_task_id,
+                            f"Proxy blocked {rotation_attempts} times (catalog)"
                         )
                         current_task_id = None
                         break
@@ -864,8 +904,10 @@ async def worker_main_loop():
                         continue
 
                     logger.error("Не удалось сменить прокси после блокировки")
-                    await database.return_task_to_queue(
-                        pool, current_task_id, "Proxy blocked (rotation failed)", increment_retry=False
+                    await database.mark_task_as_error(
+                        pool,
+                        current_task_id,
+                        "Proxy rotation failed after 403/407"
                     )
                     current_task_id = None
                     break
@@ -890,26 +932,8 @@ async def worker_main_loop():
                     )
                 except Exception as e:
                     logger.error(f"Ошибка парсинга: {e}", exc_info=True)
+                    await release_and_cleanup_current_proxy("parse_error")
                     result = {'status': 'ERROR', 'details': str(e)}
-
-                    # Cleanup браузера и прокси при ошибке парсинга (избегаем утечку ресурсов)
-                    async with state_lock:
-                        if playwright_instance and browser_instance:
-                            try:
-                                # Добавляем timeout для cleanup чтобы он не зависал
-                                await asyncio.wait_for(
-                                    browser.cleanup_browser(
-                                        playwright_instance, browser_instance, context_instance, page_instance
-                                    ),
-                                    timeout=10
-                                )
-                            except asyncio.TimeoutError:
-                                logger.error("Timeout при cleanup браузера после ошибки парсинга")
-                            except Exception as cleanup_error:
-                                logger.error(f"Ошибка при cleanup браузера: {cleanup_error}", exc_info=True)
-                        # Обнуляем переменные браузера и прокси
-                        current_proxy_id = None
-                        playwright_instance = browser_instance = context_instance = page_instance = None
 
                 # ШАГ 7: Обработка результатов
                 if result.get('status') != 'SUCCESS' or result.get('attempts_exhausted'):
@@ -955,20 +979,27 @@ async def worker_main_loop():
                 except (CaptchaNotSolvedError, ProxyBlockedError) as e:
                     # Фатальная ошибка детального парсинга - возврат задачи
                     logger.error(f"Фатальная ошибка детального парсинга: {e}")
-                    # Cleanup браузера и прокси
-                    async with state_lock:
-                        if playwright_instance and browser_instance:
-                            await browser.cleanup_browser(
-                                playwright_instance, browser_instance, context_instance, page_instance
-                            )
-                        # Обнуляем переменные
-                        current_proxy_id = None
-                        playwright_instance = browser_instance = context_instance = page_instance = None
+                    if isinstance(e, ProxyBlockedError):
+                        await block_and_cleanup_current_proxy("Proxy blocked during detailed parsing")
+                    else:
+                        await release_and_cleanup_current_proxy("captcha_detailed")
 
-                    # Возврат задачи в очередь
-                    await database.return_task_to_queue(
-                        pool, current_task_id, f"Detailed parsing error: {e}", increment_retry=True
-                    )
+                    # Проверяем счетчик попыток
+                    retry_count = await database.get_task_retry_count(pool, current_task_id)
+
+                    if retry_count + 1 >= config.MAX_RETRY_ATTEMPTS:
+                        # Исчерпаны попытки - помечаем как ошибку
+                        await database.mark_task_as_error(
+                            pool, current_task_id, f"Detailed parsing failed after {retry_count + 1} attempts: {e}"
+                        )
+                        logger.error(f"Задача #{current_task_id} помечена как ошибка после {retry_count + 1} попыток (detailed parsing)")
+                    else:
+                        # Возвращаем в очередь
+                        await database.return_task_to_queue(
+                            pool, current_task_id, f"Detailed parsing error: {e}", increment_retry=True
+                        )
+                        logger.warning(f"Задача #{current_task_id} возвращена в очередь (detailed parsing), попытка {retry_count + 1}/{config.MAX_RETRY_ATTEMPTS}")
+
                     current_task_id = None
                     continue
 
