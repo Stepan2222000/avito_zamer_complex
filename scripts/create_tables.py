@@ -5,26 +5,19 @@
 """
 
 import asyncio
-import os
 from pathlib import Path
 import asyncpg
-from dotenv import load_dotenv
+from db_utils import DB_CONFIG
 
 
 async def create_tables():
     """Создает таблицы в БД из schema.sql"""
-    # Загрузка переменных окружения
-    load_dotenv()
-
     # Параметры подключения к БД
-    db_host = os.getenv('DB_HOST', 'localhost')
-    db_port = int(os.getenv('DB_PORT', '5432'))
-    db_name = os.getenv('DB_NAME', 'avito_parser')
-    db_user = os.getenv('DB_USER', 'parser')
-    db_password = os.getenv('DB_PASSWORD')
-
-    if not db_password:
-        raise ValueError('DB_PASSWORD не задан в переменных окружения')
+    db_host = DB_CONFIG['host']
+    db_port = DB_CONFIG['port']
+    db_name = DB_CONFIG['database']
+    db_user = DB_CONFIG['user']
+    db_password = DB_CONFIG['password']
 
     print(f'Подключение к БД: {db_host}:{db_port}/{db_name}')
 

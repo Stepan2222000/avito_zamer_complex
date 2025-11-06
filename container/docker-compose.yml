@@ -1,0 +1,52 @@
+
+services:
+  worker:
+    env_file:
+      - ./.env
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      # Database
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5417}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+
+      # Worker settings (multiprocessing)
+      - NUM_WORKERS=${NUM_WORKERS:-15}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-120}
+      - STUCK_TASK_TIMEOUT=${STUCK_TASK_TIMEOUT:-3600}
+      - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
+      - NO_TASKS_WAIT=${NO_TASKS_WAIT:-30}
+      - NO_PROXIES_WAIT=${NO_PROXIES_WAIT:-60}
+
+      # Pool settings
+      - POOL_MIN_SIZE=${POOL_MIN_SIZE:-2}
+      - POOL_MAX_SIZE=${POOL_MAX_SIZE:-5}
+
+      # API keys
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+
+      # Debug configuration
+      - DEBUG_SCREENSHOTS=${DEBUG_SCREENSHOTS:-true}
+
+    volumes:
+      # X11 для виртуального дисплея
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # Увеличенная shared memory для Chromium (NUM_WORKERS браузеров в одном контейнере)
+    # 6GB для безопасности (15 воркеров × ~300-400MB на пиках)
+    shm_size: 6gb
+    restart: always
+    # Healthcheck - использует отдельный скрипт для безопасности
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  default:
+    driver: bridge

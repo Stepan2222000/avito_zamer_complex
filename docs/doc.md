@@ -19,12 +19,12 @@
 
 ### **Шаг 1.2 - Развертывание на сервере**
 
-**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose должны выполняться ТОЛЬКО из корня проекта (`/root/avito_zamer_complex-1/`)!
+**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose теперь выполняются ТОЛЬКО из каталога воркера (`/root/avito_zamer_complex-1/container/`)! Именно здесь расположен актуальный `docker-compose.yml`.
 
 Правильные команды запуска:
 ```bash
-# Переход в корень проекта
-cd /root/avito_zamer_complex-1
+# Переход в каталог container
+cd /root/avito_zamer_complex-1/container
 
 # Сборка контейнера
 docker compose build
@@ -35,6 +35,8 @@ docker compose up -d
 # Просмотр логов
 docker compose logs -f
 ```
+
+> ⚠️ Файл `.env` теперь лежит рядом с compose-файлом: `container/.env`. Его содержимое монтируется в контейнер напрямую, переносить в корень не требуется.
 
 Архитектура развертывания:
 - Запускается **1 контейнер** (не 15!)
@@ -139,7 +141,7 @@ docker compose logs -f
 17. Xvfb процессы защищены от orphans через trap механизм в entrypoint.sh с гарантированным cleanup при EXIT/SIGTERM/SIGINT
 18. Race condition при запуске Xvfb устранен - заменен `sleep 3` на активную проверку X11 sockets с timeout 30 сек
 19. Глобальная переменная `running` в supervisor заменена на `multiprocessing.Event()` для корректной синхронизации при shutdown
-20. **Критическая ошибка архитектуры** - удален устаревший `container/docker-compose.yml` с `replicas: 15`, который запускал 15×15=225 процессов вместо 15. Теперь используется только корневой docker-compose.yml с правильной архитектурой (1 контейнер + supervisor + N процессов)
+20. **Критическая ошибка архитектуры** - устранена устаревшая схема с `replicas: 15`. Актуальный `docker-compose.yml` расположен в `container/` и обеспечивает правильную архитектуру (1 контейнер + supervisor + N процессов). Запуск из других директорий запрещен, чтобы избежать дублирования процессов.
 21. **Deadlock риск устранен** - cleanup и launch браузера вынесены из `state_lock` в coordinator_task (3 места), предотвращает зависание при network issues
 22. **Zombie Xvfb обработка** - добавлена проверка на zombie процессы в entrypoint.sh с использованием `wait` для корректного reap
 23. **Healthcheck улучшен** - добавлена проверка heartbeat воркеров (fail если нет heartbeat > 5 минут), предотвращает ложные позитивы при мертвых воркерах

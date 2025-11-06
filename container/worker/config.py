@@ -36,6 +36,9 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAjRQnMmqZjt3eJnSoLlho1gC9fv1
 NO_TASKS_WAIT = 5
 NO_PROXIES_WAIT = 20
 
+# Debug Configuration
+DEBUG_SCREENSHOTS = os.getenv('DEBUG_SCREENSHOTS', 'false').lower() == 'true'
+
 # Уникальный идентификатор воркера
 # Устанавливается supervisor'ом (например: worker_1, worker_2, ...)
 # Если переменная не установлена (старый режим), используем hostname + UUID

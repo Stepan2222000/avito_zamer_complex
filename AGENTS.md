@@ -69,9 +69,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Операции с Docker
 
-**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose ДОЛЖНЫ выполняться ТОЛЬКО из корня проекта (`/root/avito_zamer_complex-1/`)
+**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose ДОЛЖНЫ выполняться ТОЛЬКО из каталога контейнера (`/root/avito_zamer_complex-1/container/`)
 
 ```bash
+# Переход в каталог container
+cd /root/avito_zamer_complex-1/container
+
 # Сборка контейнера
 docker compose build
 
@@ -84,6 +87,8 @@ docker compose logs -f
 # Остановка контейнера
 docker compose down
 ```
+
+> `.env` перенесен в `container/.env` и лежит рядом с compose-файлом. Копировать его в корень не требуется.
 
 ### Локальные скрипты управления
 
@@ -112,7 +117,7 @@ python scripts/free_proxies.py
 
 ### Конфигурация окружения
 
-Настройка через файл `.env` в корне проекта:
+Настройка через файл `container/.env`:
 
 ```bash
 # Подключение к БД
@@ -131,6 +136,8 @@ MAX_RETRY_ATTEMPTS=3        # Максимум попыток на задачу
 # ИИ-валидация
 GEMINI_API_KEY=<ваш_ключ>   # Требуется для ИИ-валидации
 ```
+
+> Скрипты из `scripts/` используют эти значения напрямую и не читают переменные окружения.
 
 ## Архитектура
 
@@ -280,7 +287,7 @@ GEMINI_API_KEY=<ваш_ключ>   # Требуется для ИИ-валида
 2. **Слишком много соединений БД:** Убедиться что NUM_WORKERS × POOL_MAX_SIZE < 100
 3. **Падения браузера:** Проверить что shm_size достаточен (6GB для 15 воркеров)
 4. **Зависшие задачи:** Проверить работу heartbeat механизма
-5. **Неправильный docker-compose.yml:** Использовать корневой docker-compose.yml, НЕ container/docker-compose.yml (удален)
+5. **Запуск не из того каталога:** `docker compose` запускается ТОЛЬКО из `container/`, используется `container/docker-compose.yml`. Старт из других директорий приводит к падению воркеров.
 
 ## Полная документация
 

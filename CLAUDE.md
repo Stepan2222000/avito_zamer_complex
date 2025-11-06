@@ -54,6 +54,9 @@ This file provides guidance to Claude Code или CODEX when working with code i
 │   │   └── validation/        # Двухуровневая валидация
 │   │       ├── mechanical.py  # Стоп-слова + ценовой фильтр
 │   │       └── ai.py          # ИИ-валидация через Gemini
+│   ├── debug/                  # Debug утилиты для отладки
+│   │   ├── __init__.py        # Экспорт функций
+│   │   └── screenshot.py      # Сохранение скриншотов для отладки
 │   ├── supervisor.py           # Менеджер multiprocessing
 │   ├── healthcheck.sh          # Мониторинг здоровья
 │   ├── check_dependencies.py  # Проверка зависимостей
@@ -73,9 +76,12 @@ This file provides guidance to Claude Code или CODEX when working with code i
 
 ### Операции с Docker
 
-**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose ДОЛЖНЫ выполняться ТОЛЬКО из корня проекта (`/root/avito_zamer_complex-1/`)
+**КРИТИЧЕСКИ ВАЖНО:** Все команды docker compose ДОЛЖНЫ выполняться ТОЛЬКО из каталога контейнера (`/root/avito_zamer_complex-1/container/`)
 
 ```bash
+# Переход в каталог container
+cd /root/avito_zamer_complex-1/container
+
 # Сборка контейнера
 docker compose build
 
@@ -88,6 +94,8 @@ docker compose logs -f
 # Остановка контейнера
 docker compose down
 ```
+
+> `.env` перенесен в `container/.env` и лежит рядом с compose-файлом. Его не нужно копировать в корень.
 
 ### Локальные скрипты управления
 
@@ -116,7 +124,7 @@ python scripts/free_proxies.py
 
 ### Конфигурация окружения
 
-Настройка через файл `.env` в корне проекта:
+Настройка через файл `container/.env`:
 
 ```bash
 # Подключение к БД
@@ -134,7 +142,55 @@ MAX_RETRY_ATTEMPTS=3        # Максимум попыток на задачу
 
 # ИИ-валидация
 GEMINI_API_KEY=<ваш_ключ>   # Требуется для ИИ-валидации
+
+# Debug конфигурация
+DEBUG_SCREENSHOTS=false     # Включить/выключить сохранение скриншотов для отладки
 ```
+
+> Скрипты из `scripts/` используют эти значения напрямую и не читают переменные окружения.
+
+### Debug утилиты
+
+Система включает утилиты для отладки, расположенные в [container/debug/](container/debug/).
+
+**Доступные функции:**
+
+1. **debug_screenshot(page, description)** - Сохранение скриншотов Playwright страниц
+
+**Использование:**
+
+```python
+from container.debug.screenshot import debug_screenshot
+
+async def coordinator_task(...):
+    # Переход на страницу каталога
+    await page.goto(catalog_url)
+
+    # Сохранить скриншот для отладки
+    await debug_screenshot(page, "after_goto_catalog")
+    # Создаст: container/worker/screenshots_after_goto_catalog/screenshot_001.png
+
+    # Парсинг данных
+    listings = await parse_catalog(page)
+
+    # Еще один скриншот
+    await debug_screenshot(page, "after_parse_catalog")
+    # Создаст: container/worker/screenshots_after_parse_catalog/screenshot_001.png
+```
+
+**Особенности:**
+
+- **Управление через .env:** Проверяет переменную `DEBUG_SCREENSHOTS` (по умолчанию `false`)
+- **Автоматическая нумерация:** Скриншоты сохраняются как `screenshot_001.png`, `screenshot_002.png`, ...
+- **Папки рядом с caller:** Папка `screenshots_{description}` создается в директории вызывающего файла
+- **Full page screenshots:** Сохраняет полный скриншот страницы (включая прокрутку)
+- **Обработка ошибок:** Не прерывает выполнение при ошибках сохранения
+
+**Важно:**
+
+- Включайте `DEBUG_SCREENSHOTS=true` ТОЛЬКО для отладки (производит много файлов)
+- Скриншоты сохраняются локально в контейнере (не в БД)
+- При работе в production всегда держите `DEBUG_SCREENSHOTS=false`
 
 ## Архитектура
 
@@ -344,7 +400,7 @@ GEMINI_API_KEY=<ваш_ключ>   # Требуется для ИИ-валида
 2. **Слишком много соединений БД:** Убедиться что NUM_WORKERS × POOL_MAX_SIZE < 100
 3. **Падения браузера:** Проверить что shm_size достаточен (6GB для 15 воркеров)
 4. **Зависшие задачи:** Проверить работу heartbeat механизма
-5. **Неправильный docker-compose.yml:** Использовать корневой docker-compose.yml, НЕ container/docker-compose.yml (удален)
+5. **Запуск не из того каталога:** `docker compose` запускается ТОЛЬКО из `container/`, используется `container/docker-compose.yml`. При запуске из корня конфигурация не найдется и воркеры не стартуют.
 6. **Истощение пула прокси:** Проверить что прокси НЕ блокируются при технических ошибках (только 403/407)
 7. **Задачи зависают в очереди:** Проверить что счетчик retry работает для всех этапов (каталог + детальный парсинг)
 

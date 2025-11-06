@@ -3,31 +3,27 @@
 Используется всеми скриптами управления системой
 """
 
-import os
 import asyncpg
 from pathlib import Path
-from dotenv import load_dotenv
+
+# Конфигурация соединения зафиксирована, чтобы скрипты не зависели от окружения
+DB_CONFIG = {
+    'host': '81.30.105.134',
+    'port': 5417,
+    'database': 'system_avito_zamer',
+    'user': 'admin',
+    'password': 'Password123',
+}
 
 
 def get_db_config() -> dict:
     """
-    Загружает конфигурацию подключения к БД из переменных окружения
+    Возвращает параметры подключения к PostgreSQL
 
     Returns:
         dict: Параметры подключения (host, port, database, user, password)
     """
-    # Загружаем .env файл если он есть
-    env_path = Path(__file__).parent.parent / '.env'
-    if env_path.exists():
-        load_dotenv(env_path)
-
-    return {
-        'host': os.getenv('DB_HOST', '81.30.105.134'),
-        'port': int(os.getenv('DB_PORT', '5417')),
-        'database': os.getenv('DB_NAME', 'system_avito_zamer'),
-        'user': os.getenv('DB_USER', 'admin'),
-        'password': os.getenv('DB_PASSWORD', 'Password123'),
-    }
+    return dict(DB_CONFIG)
 
 
 async def connect_db() -> asyncpg.Connection:

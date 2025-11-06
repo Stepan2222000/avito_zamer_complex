@@ -46,6 +46,10 @@ from . import browser
 from .errors import ProxyBlockedError, CaptchaNotSolvedError, NoProxiesAvailableError
 from .validation import validate_mechanical, validate_ai
 
+# ВРЕМЕННО
+from container.debug.screenshot import debug_screenshot
+# ЗАКРЫТИЕ ВРЕМЕННО
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +167,12 @@ async def check_and_solve_captcha(page: Page, state: str, context: str = "") -> 
 
     # Капча обнаружена - пытаемся решить
     logger.info(f"Обнаружена капча {context}, решаем...")
+
+    # ВРЕМЕННО
+    # Ожидается: Капча ПЕРЕД попыткой решения. context={context}, state={state}
+    await debug_screenshot(page, f"captcha_before_solve_{context.replace(' ', '_')}")
+    # ЗАКРЫТИЕ ВРЕМЕННО
+
     _, solved = await resolve_captcha_flow(page)
 
     if solved:
@@ -170,6 +180,12 @@ async def check_and_solve_captcha(page: Page, state: str, context: str = "") -> 
         return True
     else:
         logger.warning(f"Капча {context} не решена")
+
+        # ВРЕМЕННО
+        # Ожидается: Капча ПОСЛЕ неудачной попытки решения. context={context}
+        await debug_screenshot(page, f"captcha_failed_{context.replace(' ', '_')}")
+        # ЗАКРЫТИЕ ВРЕМЕННО
+
         return False
 
 
@@ -538,6 +554,11 @@ async def parse_detailed_cards(
             # Проверка состояния страницы
             state = await detect_page_state(page)
 
+            # ВРЕМЕННО
+            # Ожидается: Страница карточки товара Авито после перехода. state={state}. URL: {card_url}
+            await debug_screenshot(page, f"card_after_goto_id_{avito_item_id}_state_{state}")
+            # ЗАКРЫТИЕ ВРЕМЕННО
+
             # Обработка капчи
             if not await check_and_solve_captcha(page, state, f"на карточке {avito_item_id}"):
                 # Капча не решена - это фатальная ошибка, возвращаем задачу
@@ -546,6 +567,11 @@ async def parse_detailed_cards(
 
             # Проверка блокировки прокси
             if state in [PROXY_BLOCK_403_DETECTOR_ID, PROXY_AUTH_DETECTOR_ID]:
+                # ВРЕМЕННО
+                # Ожидается: Страница блокировки Авито (403/407) на карточке. card_id={avito_item_id}. ФАТАЛЬНАЯ ОШИБКА.
+                await debug_screenshot(page, f"card_proxy_blocked_id_{avito_item_id}_state_{state}")
+                # ЗАКРЫТИЕ ВРЕМЕННО
+
                 logger.error(f"Прокси заблокирован на карточке {avito_item_id}, возврат задачи")
                 raise ProxyBlockedError(f"Proxy blocked for card {avito_item_id}")
 
@@ -568,11 +594,21 @@ async def parse_detailed_cards(
 
             # Явная проверка что на странице карточка (критично для parse_card)
             if state != CARD_FOUND_DETECTOR_ID:
+                # ВРЕМЕННО
+                # Ожидается: НЕИЗВЕСТНОЕ состояние! state={state}, card_id={avito_item_id}. Что-то пошло не так.
+                await debug_screenshot(page, f"card_unexpected_state_{state}_id_{avito_item_id}")
+                # ЗАКРЫТИЕ ВРЕМЕННО
+
                 logger.warning(
                     f"Неожиданное состояние страницы {state} для карточки {avito_item_id}, пропуск"
                 )
                 error_count += 1
                 continue
+
+            # ВРЕМЕННО
+            # Ожидается: Карточка готова к парсингу HTML. card_id={avito_item_id}. Должна быть полная страница товара.
+            await debug_screenshot(page, f"card_before_html_parse_id_{avito_item_id}")
+            # ЗАКРЫТИЕ ВРЕМЕННО
 
             # Получение HTML страницы
             html = await page.content()
@@ -674,6 +710,11 @@ async def orchestrator_task(page: Page, catalog_url: str) -> dict:
         start_page=1
     )
 
+    # ВРЕМЕННО
+    # Ожидается: Последняя страница каталога после завершения парсинга. meta={meta}
+    await debug_screenshot(page, f"orchestrator_after_catalog_parse")
+    # ЗАКРЫТИЕ ВРЕМЕННО
+
     normalized_listings = [_normalize_catalog_listing(item) for item in listings]
 
     attempts_exhausted = _is_attempts_exhausted(meta.details)
@@ -715,6 +756,98 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
     global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance, state_lock
 
     current_page = initial_page
+
+    async def _release_current_browser(reason: str) -> None:
+        """Высвобождает текущие браузерные ресурсы и прокси."""
+        nonlocal current_page
+        global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance
+
+        cleanup_playwright = playwright_instance
+        cleanup_browser = browser_instance
+        cleanup_context = context_instance
+        cleanup_page = current_page
+
+        async with state_lock:
+            if current_proxy_id:
+                await database.release_proxy(pool, current_proxy_id)
+            current_proxy_id = None
+            playwright_instance = browser_instance = context_instance = page_instance = None
+
+        current_page = None
+
+        try:
+            await browser.cleanup_browser(
+                cleanup_playwright,
+                cleanup_browser,
+                cleanup_context,
+                cleanup_page
+            )
+        except Exception as cleanup_error:
+            logger.error(f"Ошибка cleanup браузера ({reason}): {cleanup_error}", exc_info=True)
+
+    async def _restart_browser_with_new_proxy(next_start_page: Optional[int], log_context: str) -> Page:
+        """Берет новый прокси, запускает браузер и открывает нужную страницу каталога."""
+        global current_proxy_id, playwright_instance, browser_instance, context_instance, page_instance
+
+        proxy_result = await database.take_free_proxy(pool, config.WORKER_ID)
+        if not proxy_result:
+            logger.error(f"Нет свободных прокси ({log_context})")
+            raise NoProxiesAvailableError("Нет свободных прокси")
+
+        new_proxy_id, proxy_address = proxy_result
+        logger.info(f"Взят новый прокси ({log_context}): {proxy_address.split(':')[0]}:****")
+
+        try:
+            new_playwright, new_browser, new_context, new_page = await browser.launch_browser(proxy_address)
+        except Exception as launch_error:
+            logger.error(f"Ошибка запуска браузера ({log_context}): {launch_error}")
+            await database.release_proxy(pool, new_proxy_id)
+            raise
+
+        target_page = next_start_page or 1
+        url = f"{catalog_url}&p={target_page}"
+
+        try:
+            if new_browser and not new_browser.is_connected():
+                logger.error("Браузер отключен перед goto при перезапуске")
+                raise PlaywrightError("Browser disconnected before goto on restart")
+
+            await new_page.goto(url, timeout=30000)
+        except (asyncio.TimeoutError, PlaywrightError) as goto_error:
+            logger.error(f"Ошибка перехода ({log_context}): {goto_error}")
+            await browser.cleanup_browser(new_playwright, new_browser, new_context, new_page)
+            await database.release_proxy(pool, new_proxy_id)
+            raise
+
+        try:
+            state = await detect_page_state(new_page)
+
+            # ВРЕМЕННО
+            # Ожидается: Каталог после перезапуска браузера с новым прокси. state={state}. Критическая точка смены прокси.
+            await debug_screenshot(new_page, f"browser_restart_new_proxy_state_{state}")
+            # ЗАКРЫТИЕ ВРЕМЕННО
+
+        except Exception as detect_error:
+            logger.error(f"Ошибка определения состояния ({log_context}): {detect_error}", exc_info=True)
+            await browser.cleanup_browser(new_playwright, new_browser, new_context, new_page)
+            await database.release_proxy(pool, new_proxy_id)
+            raise
+
+        if not await check_and_solve_captcha(new_page, state, f"после перезапуска ({log_context})"):
+            logger.warning(f"Капча не решена ({log_context}), освобождаем новый прокси")
+            await browser.cleanup_browser(new_playwright, new_browser, new_context, new_page)
+            await database.release_proxy(pool, new_proxy_id)
+            raise CaptchaNotSolvedError("Captcha not solved after browser restart")
+
+        async with state_lock:
+            current_proxy_id = new_proxy_id
+            playwright_instance = new_playwright
+            browser_instance = new_browser
+            context_instance = new_context
+            page_instance = new_page
+
+        logger.info(f"Браузер успешно перезапущен ({log_context}), продолжаем работу")
+        return new_page
 
     while running:
         try:
@@ -792,6 +925,12 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
 
                     # Проверяем состояние страницы и решаем капчу если есть
                     state = await detect_page_state(current_page)
+
+                    # ВРЕМЕННО
+                    # Ожидается: Каталог после смены прокси координатором в PROXY_BLOCKED. state={state}. Проверка что новый прокси работает.
+                    await debug_screenshot(current_page, f"coordinator_after_proxy_change_state_{state}")
+                    # ЗАКРЫТИЕ ВРЕМЕННО
+
                     if not await check_and_solve_captcha(current_page, state, "в координаторе"):
                         # Капча не решена - освобождаем прокси, закрываем браузер и пробуем другой
                         logger.warning("Капча не решена после смены прокси, освобождаем текущий прокси")
@@ -820,33 +959,51 @@ async def coordinator_task(initial_page: Page, catalog_url: str, article: str):
                     raise
 
             elif page_req.status in ["CAPTCHA_UNSOLVED", "CONTINUE_BUTTON", "RATE_LIMIT"]:
+                # ВРЕМЕННО
+                # Ожидается: Капча, rate limit или continue button по запросу оркестратора. page_status={page_req.status}
+                await debug_screenshot(current_page, f"coordinator_captcha_request_{page_req.status}")
+                # ЗАКРЫТИЕ ВРЕМЕННО
+
                 # Капча или rate limit - пытаемся решить через общую функцию
                 # Передаем любой из капча-детекторов, т.к. resolve_captcha_flow все равно сам определит тип
                 if not await check_and_solve_captcha(current_page, CAPTCHA_DETECTOR_ID, f"от оркестратора ({page_req.status})"):
                     # Не решилась - освобождаем прокси и закрываем браузер
-                    # Сохраняем переменные для cleanup вне lock
-                    cleanup_playwright = playwright_instance
-                    cleanup_browser = browser_instance
-                    cleanup_context = context_instance
-                    cleanup_page = current_page
+                    logger.warning(f"Капча не решена ({page_req.status}), перезапускаем браузер с новым прокси")
 
-                    async with state_lock:
-                        if current_proxy_id:
-                            await database.release_proxy(pool, current_proxy_id)
-                        # Обнуляем все переменные браузера для повторного запуска
-                        current_proxy_id = None
-                        playwright_instance = browser_instance = context_instance = page_instance = None
+                    await _release_current_browser(f"captcha_unsolved_{page_req.status}")
 
-                    # Cleanup ВЫНЕСЕН из lock для предотвращения deadlock
-                    await browser.cleanup_browser(
-                        cleanup_playwright, cleanup_browser, cleanup_context, cleanup_page
-                    )
-                    # Продолжаем цикл - будет новый запрос (берем новый прокси)
-                    continue
+                    try:
+                        current_page = await _restart_browser_with_new_proxy(
+                            page_req.next_start_page,
+                            f"после {page_req.status}"
+                        )
+                    except Exception as restart_error:
+                        logger.error(
+                            f"Ошибка перезапуска браузера после {page_req.status}: {restart_error}",
+                            exc_info=True
+                        )
+                        raise
 
             elif page_req.status == "NOT_DETECTED":
                 # По решению пользователя - считаем успехом, ничего не делаем
                 logger.info("NOT_DETECTED - считаем успехом, продолжаем")
+
+            if not current_page or current_page.is_closed():
+                logger.warning("Обнаружена недоступная страница перед supply_page, перезапускаем браузер")
+
+                await _release_current_browser("dead_page_before_supply")
+
+                try:
+                    current_page = await _restart_browser_with_new_proxy(
+                        page_req.next_start_page,
+                        "перед supply_page"
+                    )
+                except Exception as restart_error:
+                    logger.error(
+                        f"Ошибка перезапуска браузера перед supply_page: {restart_error}",
+                        exc_info=True
+                    )
+                    raise
 
             # Возвращаем страницу оркестратору
             supply_page(current_page)
@@ -941,6 +1098,12 @@ async def worker_main_loop():
                         raise PlaywrightError("Browser disconnected before catalog goto")
 
                     await page_instance.goto(catalog_url, timeout=30000)  # Таймаут 30 секунд
+
+                    # ВРЕМЕННО
+                    # Ожидается: Страница каталога Авито со списком товаров по артикулу. Может быть капча или страница блокировки.
+                    await debug_screenshot(page_instance, "worker_catalog_after_goto")
+                    # ЗАКРЫТИЕ ВРЕМЕННО
+
                 except (asyncio.TimeoutError, PlaywrightError) as e:
                     logger.error(f"Ошибка перехода на каталог: {e}")
                     await release_and_cleanup_current_proxy("catalog_goto_error")
@@ -985,6 +1148,11 @@ async def worker_main_loop():
 
                 # Проверка блокировки прокси
                 if state in [PROXY_BLOCK_403_DETECTOR_ID, PROXY_AUTH_DETECTOR_ID]:
+                    # ВРЕМЕННО
+                    # Ожидается: Страница блокировки Авито (403 Forbidden) или ошибка авторизации прокси (407).
+                    await debug_screenshot(page_instance, f"worker_proxy_blocked_state_{state}")
+                    # ЗАКРЫТИЕ ВРЕМЕННО
+
                     logger.warning("Прокси заблокирован при переходе, пробуем сменить без возврата задачи")
                     rotation_attempts += 1
 
